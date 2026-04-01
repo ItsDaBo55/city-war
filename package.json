@@ -1,0 +1,12 @@
+{
+  "name": "city-war",
+  "version": "1.0.0",
+  "description": "City War multiplayer Socket.IO server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "socket.io": "^4.7.0"
+  }
+}
