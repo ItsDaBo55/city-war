@@ -7,18 +7,35 @@
  * Requires: npm install socket.io
  */
 
-const { Server } = require('socket.io');
+const express = require('express');
 const http = require('http');
+const socketIo = require('socket.io');
+const cors = require('cors');
 
-const PORT = process.env.PORT || 3001;
-
-const httpServer = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('City Wars Server Running');
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    },
+    pingTimeout: 60000,
+    pingInterval: 25000
 });
 
-const io = new Server(httpServer, {
-  cors: { origin: '*', methods: ['GET', 'POST'] },
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type']
+}));
+
+app.get('/', (req, res) => {
+    res.send('Hello World!');
+});
+
+const port = process.env.PORT || 3000;
+server.listen(port, () => {
+    console.log(`Server is running on ${port}`);
 });
 
 // ─── State ────────────────────────────────────────────────
@@ -263,7 +280,3 @@ function leaveCurrentRoom(socket) {
     }
   }
 }
-
-httpServer.listen(PORT, () => {
-  console.log(`\n🎮 City Wars Server running on port ${PORT}\n`);
-});
