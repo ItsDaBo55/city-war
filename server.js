@@ -43,7 +43,6 @@ const rooms = new Map();        // roomId -> Room
 const playerRooms = new Map();  // socketId -> roomId
 
 const DEFAULT_SETTINGS = {
-  maxTime: 180,
   gracePeriod: 60,
   startMoney: 200,
   incomeMultiplier: 1,
