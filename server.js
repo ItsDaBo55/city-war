@@ -1,10 +1,5 @@
 /**
- * City Wars - Socket.IO Multiplayer Server
- * 
- * Run: node server.js
- * Or:  PORT=4000 node server.js
- * 
- * Requires: npm install socket.io
+ * City War - Authoritative Socket.IO Multiplayer Server
  */
 
 const express = require('express');
@@ -15,32 +10,41 @@ const cors = require('cors');
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    },
-    pingTimeout: 60000,
-    pingInterval: 25000
+  cors: { origin: '*', methods: ['GET', 'POST'] },
+  pingTimeout: 60000,
+  pingInterval: 25000,
 });
 
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST'],
-    allowedHeaders: ['Content-Type']
-}));
-
-app.get('/', (req, res) => {
-    res.send('Hello World!');
-});
+app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
+app.get('/', (req, res) => res.send('City Wars Server Running'));
 
 const port = process.env.PORT || 3000;
-server.listen(port, () => {
-    console.log(`Server is running on ${port}`);
-});
+server.listen(port, () => console.log(`\n🎮 City Wars Server running on port ${port}\n`));
 
-// ─── State ────────────────────────────────────────────────
-const rooms = new Map();        // roomId -> Room
-const playerRooms = new Map();  // socketId -> roomId
+// ─── Game Templates (must match client constants) ─────────
+const BUILDING_TEMPLATES = [
+  { type: 'house', cost: 30, income: 2, hp: 40, maxCount: 10 },
+  { type: 'apartment', cost: 60, income: 5, hp: 70, maxCount: 8 },
+  { type: 'hotel', cost: 100, income: 8, hp: 90, maxCount: 6 },
+  { type: 'skyscraper', cost: 180, income: 14, hp: 120, maxCount: 5 },
+  { type: 'factory', cost: 250, income: 20, hp: 150, maxCount: 3 },
+];
+
+const MISSILE_TEMPLATES = [
+  { type: 'dart', cost: 15, upgradeCost: 50 },
+  { type: 'rocket', cost: 30, upgradeCost: 80 },
+  { type: 'cruise', cost: 60, upgradeCost: 120 },
+  { type: 'ballistic', cost: 100, upgradeCost: 200 },
+  { type: 'nuke', cost: 200, upgradeCost: 400 },
+];
+
+const DEFENSE_TEMPLATES = [
+  { type: 'turret', cost: 40, maxCount: 3, upgradeCost: 60, armCost: 20 },
+  { type: 'sam', cost: 80, maxCount: 2, upgradeCost: 100, armCost: 35 },
+  { type: 'laser', cost: 150, maxCount: 2, upgradeCost: 180, armCost: 50 },
+  { type: 'railgun', cost: 250, maxCount: 1, upgradeCost: 300, armCost: 75 },
+  { type: 'aegis', cost: 400, maxCount: 1, upgradeCost: 500, armCost: 100 },
+];
 
 const DEFAULT_SETTINGS = {
   gracePeriod: 60,
@@ -50,8 +54,40 @@ const DEFAULT_SETTINGS = {
   unlockedDefenses: ['turret', 'sam'],
 };
 
+// ─── State ────────────────────────────────────────────────
+const rooms = new Map();
+const playerRooms = new Map();
+const gameStates = new Map(); // roomId -> { left: PlayerState, right: PlayerState, incomeInterval }
+
 function generateId() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
+function createPlayerState(settings) {
+  const missiles = {};
+  MISSILE_TEMPLATES.forEach(t => {
+    missiles[t.type] = {
+      unlocked: settings.unlockedMissiles.includes(t.type),
+      level: 1,
+      upgradeCost: t.upgradeCost,
+    };
+  });
+  const defenses = {};
+  DEFENSE_TEMPLATES.forEach(t => {
+    defenses[t.type] = {
+      unlocked: settings.unlockedDefenses.includes(t.type),
+      level: 1,
+      upgradeCost: t.upgradeCost,
+    };
+  });
+  return {
+    money: settings.startMoney,
+    buildingCounts: {},
+    defenseCounts: {},
+    missiles,
+    defenses,
+    queuedCost: 0,
+  };
 }
 
 function getRoomList() {
@@ -74,14 +110,18 @@ function broadcastRoomList() {
   io.emit('rooms-list', getRoomList());
 }
 
+function cleanupGameState(roomId) {
+  const gs = gameStates.get(roomId);
+  if (gs && gs.incomeInterval) clearInterval(gs.incomeInterval);
+  gameStates.delete(roomId);
+}
+
 // Cleanup stale rooms every 60s
 setInterval(() => {
   const now = Date.now();
   for (const [id, room] of rooms) {
-    // Remove rooms older than 30 min or finished rooms older than 5 min
     const maxAge = room.status === 'finished' ? 5 * 60_000 : 30 * 60_000;
     if (now - room.createdAt > maxAge) {
-      // Kick remaining players
       room.players.forEach(p => {
         const sock = io.sockets.sockets.get(p.id);
         if (sock) {
@@ -90,27 +130,129 @@ setInterval(() => {
           playerRooms.delete(p.id);
         }
       });
+      cleanupGameState(id);
       rooms.delete(id);
     }
   }
   broadcastRoomList();
 }, 60_000);
 
+// ─── Action Validation ────────────────────────────────────
+function validateAction(ps, action) {
+  switch (action.type) {
+    case 'build': {
+      const tmpl = BUILDING_TEMPLATES.find(t => t.type === action.buildingType);
+      if (!tmpl) return { ok: false, error: 'Invalid building' };
+      const count = ps.buildingCounts[tmpl.type] || 0;
+      if (count >= tmpl.maxCount) return { ok: false, error: 'Max count reached' };
+      if (ps.money < tmpl.cost) return { ok: false, error: 'Not enough money' };
+      ps.money -= tmpl.cost;
+      ps.buildingCounts[tmpl.type] = count + 1;
+      return { ok: true };
+    }
+    case 'place-defense': {
+      const tmpl = DEFENSE_TEMPLATES.find(t => t.type === action.defenseType);
+      if (!tmpl) return { ok: false, error: 'Invalid defense' };
+      const ds = ps.defenses[tmpl.type];
+      if (!ds || !ds.unlocked) return { ok: false, error: 'Not unlocked' };
+      const count = ps.defenseCounts[tmpl.type] || 0;
+      if (count >= tmpl.maxCount) return { ok: false, error: 'Max count reached' };
+      if (ps.money < tmpl.cost) return { ok: false, error: 'Not enough money' };
+      ps.money -= tmpl.cost;
+      ps.defenseCounts[tmpl.type] = count + 1;
+      return { ok: true };
+    }
+    case 'queue-missile': {
+      const tmpl = MISSILE_TEMPLATES.find(t => t.type === action.missileType);
+      if (!tmpl) return { ok: false, error: 'Invalid missile' };
+      const ms = ps.missiles[tmpl.type];
+      if (!ms || !ms.unlocked) return { ok: false, error: 'Not unlocked' };
+      if (ps.money < tmpl.cost) return { ok: false, error: 'Not enough money' };
+      ps.money -= tmpl.cost;
+      ps.queuedCost += tmpl.cost;
+      return { ok: true };
+    }
+    case 'launch-queue': {
+      ps.queuedCost = 0;
+      return { ok: true };
+    }
+    case 'clear-queue': {
+      ps.money += ps.queuedCost;
+      ps.queuedCost = 0;
+      return { ok: true };
+    }
+    case 'unlock-missile': {
+      const tmpl = MISSILE_TEMPLATES.find(t => t.type === action.missileType);
+      if (!tmpl) return { ok: false, error: 'Invalid missile' };
+      const ms = ps.missiles[tmpl.type];
+      if (!ms) return { ok: false, error: 'Invalid missile' };
+      if (ms.unlocked) return { ok: false, error: 'Already unlocked' };
+      const cost = tmpl.cost * 3;
+      if (ps.money < cost) return { ok: false, error: 'Not enough money' };
+      ps.money -= cost;
+      ms.unlocked = true;
+      return { ok: true };
+    }
+    case 'upgrade-missile': {
+      const tmpl = MISSILE_TEMPLATES.find(t => t.type === action.missileType);
+      if (!tmpl) return { ok: false, error: 'Invalid missile' };
+      const ms = ps.missiles[tmpl.type];
+      if (!ms || !ms.unlocked) return { ok: false, error: 'Not unlocked' };
+      if (ms.level >= 5) return { ok: false, error: 'Max level' };
+      if (ps.money < ms.upgradeCost) return { ok: false, error: 'Not enough money' };
+      ps.money -= ms.upgradeCost;
+      ms.level += 1;
+      ms.upgradeCost = Math.floor(ms.upgradeCost * 1.5);
+      return { ok: true };
+    }
+    case 'unlock-defense': {
+      const tmpl = DEFENSE_TEMPLATES.find(t => t.type === action.defenseType);
+      if (!tmpl) return { ok: false, error: 'Invalid defense' };
+      const ds = ps.defenses[tmpl.type];
+      if (!ds) return { ok: false, error: 'Invalid defense' };
+      if (ds.unlocked) return { ok: false, error: 'Already unlocked' };
+      const cost = tmpl.cost * 2;
+      if (ps.money < cost) return { ok: false, error: 'Not enough money' };
+      ps.money -= cost;
+      ds.unlocked = true;
+      return { ok: true };
+    }
+    case 'upgrade-defense': {
+      const tmpl = DEFENSE_TEMPLATES.find(t => t.type === action.defenseType);
+      if (!tmpl) return { ok: false, error: 'Invalid defense' };
+      const ds = ps.defenses[tmpl.type];
+      if (!ds || !ds.unlocked) return { ok: false, error: 'Not unlocked' };
+      if (ds.level >= 5) return { ok: false, error: 'Max level' };
+      if (ps.money < ds.upgradeCost) return { ok: false, error: 'Not enough money' };
+      ps.money -= ds.upgradeCost;
+      ds.level += 1;
+      ds.upgradeCost = Math.floor(ds.upgradeCost * 1.5);
+      return { ok: true };
+    }
+    case 'arm-defense': {
+      const defType = action.defenseType;
+      if (!defType) return { ok: false, error: 'Missing defense type' };
+      const tmpl = DEFENSE_TEMPLATES.find(t => t.type === defType);
+      if (!tmpl) return { ok: false, error: 'Invalid defense type' };
+      if (ps.money < tmpl.armCost) return { ok: false, error: 'Not enough money' };
+      ps.money -= tmpl.armCost;
+      return { ok: true };
+    }
+    default:
+      return { ok: false, error: 'Unknown action' };
+  }
+}
+
 // ─── Socket handlers ──────────────────────────────────────
 io.on('connection', (socket) => {
   console.log(`[+] ${socket.id} connected`);
 
-  // List rooms
   socket.on('list-rooms', (cb) => {
     if (typeof cb === 'function') cb(getRoomList());
   });
 
-  // Create room
   socket.on('create-room', ({ nickname, roomName, settings }, cb) => {
-    if (!nickname || nickname.length > 20) {
-      return cb({ ok: false, error: 'Invalid nickname' });
-    }
-    // Leave any existing room
+    if (!nickname || nickname.length > 20) return cb({ ok: false, error: 'Invalid nickname' });
     leaveCurrentRoom(socket);
 
     const roomId = generateId();
@@ -118,12 +260,7 @@ io.on('connection', (socket) => {
       id: roomId,
       name: roomName || `${nickname}'s Room`,
       host: socket.id,
-      players: [{
-        id: socket.id,
-        nickname: nickname.substring(0, 20),
-        ready: false,
-        side: 'left',
-      }],
+      players: [{ id: socket.id, nickname: nickname.substring(0, 20), ready: false, side: 'left' }],
       settings: { ...DEFAULT_SETTINGS, ...settings },
       status: 'waiting',
       createdAt: Date.now(),
@@ -131,76 +268,56 @@ io.on('connection', (socket) => {
     rooms.set(roomId, room);
     playerRooms.set(socket.id, roomId);
     socket.join(roomId);
-
     cb({ ok: true, room });
     broadcastRoomList();
     console.log(`[Room] ${nickname} created room ${roomId}`);
   });
 
-  // Join room
   socket.on('join-room', ({ nickname, roomId }, cb) => {
-    if (!nickname || nickname.length > 20) {
-      return cb({ ok: false, error: 'Invalid nickname' });
-    }
+    if (!nickname || nickname.length > 20) return cb({ ok: false, error: 'Invalid nickname' });
     const room = rooms.get(roomId);
     if (!room) return cb({ ok: false, error: 'Room not found' });
     if (room.status !== 'waiting') return cb({ ok: false, error: 'Game already in progress' });
     if (room.players.length >= 2) return cb({ ok: false, error: 'Room is full' });
-
-    // Leave any existing room
     leaveCurrentRoom(socket);
 
     const side = room.players[0]?.side === 'left' ? 'right' : 'left';
-    room.players.push({
-      id: socket.id,
-      nickname: nickname.substring(0, 20),
-      ready: false,
-      side,
-    });
+    room.players.push({ id: socket.id, nickname: nickname.substring(0, 20), ready: false, side });
     playerRooms.set(socket.id, roomId);
     socket.join(roomId);
-
     cb({ ok: true, room });
     io.to(roomId).emit('room-updated', room);
     broadcastRoomList();
     console.log(`[Room] ${nickname} joined room ${roomId}`);
   });
 
-  // Leave room
   socket.on('leave-room', (cb) => {
     leaveCurrentRoom(socket);
     if (typeof cb === 'function') cb({ ok: true });
     broadcastRoomList();
   });
 
-  // Toggle ready
   socket.on('toggle-ready', (cb) => {
     const roomId = playerRooms.get(socket.id);
     if (!roomId) return cb({ ok: false });
     const room = rooms.get(roomId);
     if (!room) return cb({ ok: false });
-
     const player = room.players.find(p => p.id === socket.id);
     if (player) player.ready = !player.ready;
-
     cb({ ok: true });
     io.to(roomId).emit('room-updated', room);
   });
 
-  // Update settings (host only)
   socket.on('update-settings', ({ settings }, cb) => {
     const roomId = playerRooms.get(socket.id);
     if (!roomId) return cb({ ok: false });
     const room = rooms.get(roomId);
-    if (!room || room.host !== socket.id) return cb({ ok: false });
-    if (room.status !== 'waiting') return cb({ ok: false });
-
+    if (!room || room.host !== socket.id || room.status !== 'waiting') return cb({ ok: false });
     room.settings = { ...room.settings, ...settings };
     cb({ ok: true });
     io.to(roomId).emit('room-updated', room);
   });
 
-  // Start game (host only, both players must be ready)
   socket.on('start-game', (cb) => {
     const roomId = playerRooms.get(socket.id);
     if (!roomId) return cb({ ok: false, error: 'Not in a room' });
@@ -211,39 +328,86 @@ io.on('connection', (socket) => {
     if (!room.players.every(p => p.ready)) return cb({ ok: false, error: 'All players must be ready' });
 
     room.status = 'playing';
-    cb({ ok: true });
 
+    // Initialize authoritative game state with room settings
+    const gs = {
+      left: createPlayerState(room.settings),
+      right: createPlayerState(room.settings),
+      incomeInterval: null,
+    };
+
+    // Start income ticker (every second)
+    gs.incomeInterval = setInterval(() => {
+      const currentRoom = rooms.get(roomId);
+      if (!currentRoom || currentRoom.status !== 'playing') {
+        clearInterval(gs.incomeInterval);
+        return;
+      }
+      ['left', 'right'].forEach(side => {
+        const ps = gs[side];
+        let income = 0;
+        for (const [type, count] of Object.entries(ps.buildingCounts)) {
+          const tmpl = BUILDING_TEMPLATES.find(t => t.type === type);
+          if (tmpl) income += tmpl.income * count;
+        }
+        income *= (currentRoom.settings.incomeMultiplier || 1);
+        ps.money += income;
+      });
+      // Send money sync to both players
+      currentRoom.players.forEach(p => {
+        const sock = io.sockets.sockets.get(p.id);
+        const ps = gs[p.side];
+        if (sock && ps) {
+          sock.emit('money-sync', ps.money);
+        }
+      });
+    }, 1000);
+
+    gameStates.set(roomId, gs);
+
+    cb({ ok: true });
     room.players.forEach(p => {
       const sock = io.sockets.sockets.get(p.id);
-      if (sock) {
-        sock.emit('game-started', { room, yourSide: p.side });
-      }
+      if (sock) sock.emit('game-started', { room, yourSide: p.side });
     });
     broadcastRoomList();
-    console.log(`[Game] Room ${roomId} started`);
+    console.log(`[Game] Room ${roomId} started with settings:`, JSON.stringify(room.settings));
   });
 
-  // Game action relay
-  socket.on('game-action', (action) => {
+  // ─── Authoritative game action handler ──────────────────
+  socket.on('game-action', (action, cb) => {
     const roomId = playerRooms.get(socket.id);
-    if (!roomId) return;
+    if (!roomId) return cb?.({ ok: false, error: 'Not in room' });
     const room = rooms.get(roomId);
-    if (!room || room.status !== 'playing') return;
+    if (!room || room.status !== 'playing') return cb?.({ ok: false, error: 'Not playing' });
 
-    // Relay to opponent only
-    socket.to(roomId).emit('opponent-action', action);
+    const gs = gameStates.get(roomId);
+    if (!gs) return cb?.({ ok: false, error: 'No game state' });
+
+    const player = room.players.find(p => p.id === socket.id);
+    if (!player) return cb?.({ ok: false, error: 'Not a player' });
+
+    const ps = gs[player.side];
+    const result = validateAction(ps, action);
+
+    if (result.ok) {
+      // Relay validated action to opponent
+      socket.to(roomId).emit('opponent-action', action);
+      cb?.({ ok: true, money: ps.money });
+    } else {
+      cb?.({ ok: false, error: result.error, money: ps.money });
+    }
   });
 
-  // Disconnect
   socket.on('disconnect', () => {
     console.log(`[-] ${socket.id} disconnected`);
     const roomId = playerRooms.get(socket.id);
     if (roomId) {
       const room = rooms.get(roomId);
       if (room && room.status === 'playing') {
-        // Notify opponent
         socket.to(roomId).emit('opponent-disconnected');
         room.status = 'finished';
+        cleanupGameState(roomId);
       }
       leaveCurrentRoom(socket);
       broadcastRoomList();
@@ -264,18 +428,16 @@ function leaveCurrentRoom(socket) {
   room.players = room.players.filter(p => p.id !== socket.id);
 
   if (room.players.length === 0) {
+    cleanupGameState(roomId);
     rooms.delete(roomId);
     console.log(`[Room] ${roomId} deleted (empty)`);
   } else {
-    // Transfer host
-    if (room.host === socket.id) {
-      room.host = room.players[0].id;
-    }
+    if (room.host === socket.id) room.host = room.players[0].id;
     io.to(roomId).emit('room-updated', room);
-    
     if (room.status === 'playing') {
       io.to(roomId).emit('opponent-disconnected');
       room.status = 'finished';
+      cleanupGameState(roomId);
     }
   }
 }
