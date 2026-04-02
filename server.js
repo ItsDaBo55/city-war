@@ -82,11 +82,12 @@ function createPlayerState(settings) {
   });
   return {
     money: settings.startMoney,
-    buildingCounts: {},
+    buildingCounts: { house: 1 }, // mirrors the starter house every client spawns
     defenseCounts: {},
     missiles,
     defenses,
     queuedCost: 0,
+    queuedMissiles: [], // buffer — flushed as a single relay on launch-queue
   };
 }
 
@@ -170,16 +171,23 @@ function validateAction(ps, action) {
       if (ps.money < tmpl.cost) return { ok: false, error: 'Not enough money' };
       ps.money -= tmpl.cost;
       ps.queuedCost += tmpl.cost;
-      return { ok: true };
+      // Buffer for batch relay — do NOT relay individually to opponent
+      ps.queuedMissiles.push({ missileType: action.missileType, targetX: action.targetX, targetY: action.targetY });
+      return { ok: true, skipRelay: true };
     }
     case 'launch-queue': {
+      const missiles = ps.queuedMissiles.splice(0); // drain buffer atomically
       ps.queuedCost = 0;
-      return { ok: true };
+      if (missiles.length === 0) return { ok: true, skipRelay: true };
+      // Relay all queued missiles in a single action — opponent gets everything at once
+      return { ok: true, relayAction: { type: 'launch-missiles', missiles } };
     }
     case 'clear-queue': {
       ps.money += ps.queuedCost;
       ps.queuedCost = 0;
-      return { ok: true };
+      ps.queuedMissiles = [];
+      // Opponent never received individual queue-missile events, nothing to clear on their side
+      return { ok: true, skipRelay: true };
     }
     case 'unlock-missile': {
       const tmpl = MISSILE_TEMPLATES.find(t => t.type === action.missileType);
@@ -391,8 +399,10 @@ io.on('connection', (socket) => {
     const result = validateAction(ps, action);
 
     if (result.ok) {
-      // Relay validated action to opponent
-      socket.to(roomId).emit('opponent-action', action);
+      // skipRelay: don't forward (buffered); relayAction: send a different payload; default: relay original
+      if (!result.skipRelay) {
+        socket.to(roomId).emit('opponent-action', result.relayAction || action);
+      }
       cb?.({ ok: true, money: ps.money });
     } else {
       cb?.({ ok: false, error: result.error, money: ps.money });
