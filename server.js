@@ -50,8 +50,8 @@ const DEFAULT_SETTINGS = {
   gracePeriod: 60,
   startMoney: 200,
   incomeMultiplier: 1,
-  unlockedMissiles: ['dart', 'rocket'],
-  unlockedDefenses: ['turret', 'sam'],
+  allowedMissiles: ['dart', 'rocket', 'cruise', 'ballistic', 'nuke'],
+  allowedDefenses: ['turret', 'sam', 'laser', 'railgun', 'aegis'],
 };
 
 // ─── State ────────────────────────────────────────────────
@@ -64,30 +64,42 @@ function generateId() {
 }
 
 function createPlayerState(settings) {
+  const allowedMissiles = settings.allowedMissiles || DEFAULT_SETTINGS.allowedMissiles;
+  const allowedDefenses = settings.allowedDefenses || DEFAULT_SETTINGS.allowedDefenses;
+
   const missiles = {};
   MISSILE_TEMPLATES.forEach(t => {
     missiles[t.type] = {
-      unlocked: settings.unlockedMissiles.includes(t.type),
+      unlocked: false, // nothing starts unlocked — players must unlock during game
+      allowed: allowedMissiles.includes(t.type), // but only allowed ones can be unlocked
       level: 1,
       upgradeCost: t.upgradeCost,
     };
   });
+  // First two allowed missiles start unlocked by default (dart, rocket style)
+  const defaultUnlocked = allowedMissiles.slice(0, 2);
+  defaultUnlocked.forEach(type => { if (missiles[type]) missiles[type].unlocked = true; });
+
   const defenses = {};
   DEFENSE_TEMPLATES.forEach(t => {
     defenses[t.type] = {
-      unlocked: settings.unlockedDefenses.includes(t.type),
+      unlocked: false,
+      allowed: allowedDefenses.includes(t.type),
       level: 1,
       upgradeCost: t.upgradeCost,
     };
   });
+  const defaultDefUnlocked = allowedDefenses.slice(0, 2);
+  defaultDefUnlocked.forEach(type => { if (defenses[type]) defenses[type].unlocked = true; });
+
   return {
     money: settings.startMoney,
-    buildingCounts: { house: 1 }, // mirrors the starter house every client spawns
+    buildingCounts: { house: 1 },
     defenseCounts: {},
     missiles,
     defenses,
     queuedCost: 0,
-    queuedMissiles: [], // buffer — flushed as a single relay on launch-queue
+    queuedMissiles: [],
   };
 }
 
@@ -156,6 +168,7 @@ function validateAction(ps, action) {
       if (!tmpl) return { ok: false, error: 'Invalid defense' };
       const ds = ps.defenses[tmpl.type];
       if (!ds || !ds.unlocked) return { ok: false, error: 'Not unlocked' };
+      if (!ds.allowed) return { ok: false, error: 'Not allowed in this match' };
       const count = ps.defenseCounts[tmpl.type] || 0;
       if (count >= tmpl.maxCount) return { ok: false, error: 'Max count reached' };
       if (ps.money < tmpl.cost) return { ok: false, error: 'Not enough money' };
@@ -168,6 +181,7 @@ function validateAction(ps, action) {
       if (!tmpl) return { ok: false, error: 'Invalid missile' };
       const ms = ps.missiles[tmpl.type];
       if (!ms || !ms.unlocked) return { ok: false, error: 'Not unlocked' };
+      if (!ms.allowed) return { ok: false, error: 'Not allowed in this match' };
       if (ps.money < tmpl.cost) return { ok: false, error: 'Not enough money' };
       ps.money -= tmpl.cost;
       ps.queuedCost += tmpl.cost;
@@ -194,6 +208,7 @@ function validateAction(ps, action) {
       if (!tmpl) return { ok: false, error: 'Invalid missile' };
       const ms = ps.missiles[tmpl.type];
       if (!ms) return { ok: false, error: 'Invalid missile' };
+      if (!ms.allowed) return { ok: false, error: 'Not allowed in this match' };
       if (ms.unlocked) return { ok: false, error: 'Already unlocked' };
       const cost = tmpl.cost * 3;
       if (ps.money < cost) return { ok: false, error: 'Not enough money' };
@@ -218,6 +233,7 @@ function validateAction(ps, action) {
       if (!tmpl) return { ok: false, error: 'Invalid defense' };
       const ds = ps.defenses[tmpl.type];
       if (!ds) return { ok: false, error: 'Invalid defense' };
+      if (!ds.allowed) return { ok: false, error: 'Not allowed in this match' };
       if (ds.unlocked) return { ok: false, error: 'Already unlocked' };
       const cost = tmpl.cost * 2;
       if (ps.money < cost) return { ok: false, error: 'Not enough money' };
@@ -326,7 +342,34 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('room-updated', room);
   });
 
-  socket.on('start-game', (cb) => {
+  socket.on('kick-player', ({ playerId }, cb) => {
+    const roomId = playerRooms.get(socket.id);
+    if (!roomId) return cb?.({ ok: false, error: 'Not in a room' });
+    const room = rooms.get(roomId);
+    if (!room) return cb?.({ ok: false, error: 'Room not found' });
+    if (room.host !== socket.id) return cb?.({ ok: false, error: 'Only host can kick' });
+    if (room.status !== 'waiting') return cb?.({ ok: false, error: 'Cannot kick during game' });
+    if (playerId === socket.id) return cb?.({ ok: false, error: 'Cannot kick yourself' });
+
+    const target = room.players.find(p => p.id === playerId);
+    if (!target) return cb?.({ ok: false, error: 'Player not found' });
+
+    // Remove player from room
+    room.players = room.players.filter(p => p.id !== playerId);
+    playerRooms.delete(playerId);
+
+    const targetSocket = io.sockets.sockets.get(playerId);
+    if (targetSocket) {
+      targetSocket.emit('kicked', 'You were kicked from the room');
+      targetSocket.leave(roomId);
+    }
+
+    cb?.({ ok: true });
+    io.to(roomId).emit('room-updated', room);
+    broadcastRoomList();
+    console.log(`[Room] ${target.nickname} was kicked from room ${roomId}`);
+  });
+
     const roomId = playerRooms.get(socket.id);
     if (!roomId) return cb({ ok: false, error: 'Not in a room' });
     const room = rooms.get(roomId);
