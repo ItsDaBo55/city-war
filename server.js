@@ -50,57 +50,44 @@ const DEFAULT_SETTINGS = {
   gracePeriod: 60,
   startMoney: 200,
   incomeMultiplier: 1,
-  allowedMissiles: ['dart', 'rocket', 'cruise', 'ballistic', 'nuke'],
-  allowedDefenses: ['turret', 'sam', 'laser', 'railgun', 'aegis'],
-  map: 'city',
-  powerUps: false,
+  unlockedMissiles: ['dart', 'rocket'],
+  unlockedDefenses: ['turret', 'sam'],
 };
 
 // ─── State ────────────────────────────────────────────────
 const rooms = new Map();
 const playerRooms = new Map();
-const gameStates = new Map();
+const gameStates = new Map(); // roomId -> { left: PlayerState, right: PlayerState, incomeInterval }
 
 function generateId() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
 function createPlayerState(settings) {
-  const allowedMissiles = settings.allowedMissiles || DEFAULT_SETTINGS.allowedMissiles;
-  const allowedDefenses = settings.allowedDefenses || DEFAULT_SETTINGS.allowedDefenses;
-
   const missiles = {};
   MISSILE_TEMPLATES.forEach(t => {
     missiles[t.type] = {
-      unlocked: false,
-      allowed: allowedMissiles.includes(t.type),
+      unlocked: settings.unlockedMissiles.includes(t.type),
       level: 1,
       upgradeCost: t.upgradeCost,
     };
   });
-  const defaultUnlocked = allowedMissiles.slice(0, 2);
-  defaultUnlocked.forEach(type => { if (missiles[type]) missiles[type].unlocked = true; });
-
   const defenses = {};
   DEFENSE_TEMPLATES.forEach(t => {
     defenses[t.type] = {
-      unlocked: false,
-      allowed: allowedDefenses.includes(t.type),
+      unlocked: settings.unlockedDefenses.includes(t.type),
       level: 1,
       upgradeCost: t.upgradeCost,
     };
   });
-  const defaultDefUnlocked = allowedDefenses.slice(0, 2);
-  defaultDefUnlocked.forEach(type => { if (defenses[type]) defenses[type].unlocked = true; });
-
   return {
     money: settings.startMoney,
-    buildingCounts: { house: 1 },
+    buildingCounts: { house: 1 }, // mirrors the starter house every client spawns
     defenseCounts: {},
     missiles,
     defenses,
     queuedCost: 0,
-    queuedMissiles: [],
+    queuedMissiles: [], // buffer — flushed as a single relay on launch-queue
   };
 }
 
@@ -126,10 +113,7 @@ function broadcastRoomList() {
 
 function cleanupGameState(roomId) {
   const gs = gameStates.get(roomId);
-  if (gs) {
-    if (gs.incomeInterval) clearInterval(gs.incomeInterval);
-    if (gs.powerUpInterval) clearInterval(gs.powerUpInterval);
-  }
+  if (gs && gs.incomeInterval) clearInterval(gs.incomeInterval);
   gameStates.delete(roomId);
 }
 
@@ -172,7 +156,6 @@ function validateAction(ps, action) {
       if (!tmpl) return { ok: false, error: 'Invalid defense' };
       const ds = ps.defenses[tmpl.type];
       if (!ds || !ds.unlocked) return { ok: false, error: 'Not unlocked' };
-      if (!ds.allowed) return { ok: false, error: 'Not allowed in this match' };
       const count = ps.defenseCounts[tmpl.type] || 0;
       if (count >= tmpl.maxCount) return { ok: false, error: 'Max count reached' };
       if (ps.money < tmpl.cost) return { ok: false, error: 'Not enough money' };
@@ -185,23 +168,25 @@ function validateAction(ps, action) {
       if (!tmpl) return { ok: false, error: 'Invalid missile' };
       const ms = ps.missiles[tmpl.type];
       if (!ms || !ms.unlocked) return { ok: false, error: 'Not unlocked' };
-      if (!ms.allowed) return { ok: false, error: 'Not allowed in this match' };
       if (ps.money < tmpl.cost) return { ok: false, error: 'Not enough money' };
       ps.money -= tmpl.cost;
       ps.queuedCost += tmpl.cost;
+      // Buffer for batch relay — do NOT relay individually to opponent
       ps.queuedMissiles.push({ missileType: action.missileType, targetX: action.targetX, targetY: action.targetY });
       return { ok: true, skipRelay: true };
     }
     case 'launch-queue': {
-      const missiles = ps.queuedMissiles.splice(0);
+      const missiles = ps.queuedMissiles.splice(0); // drain buffer atomically
       ps.queuedCost = 0;
       if (missiles.length === 0) return { ok: true, skipRelay: true };
+      // Relay all queued missiles in a single action — opponent gets everything at once
       return { ok: true, relayAction: { type: 'launch-missiles', missiles } };
     }
     case 'clear-queue': {
       ps.money += ps.queuedCost;
       ps.queuedCost = 0;
       ps.queuedMissiles = [];
+      // Opponent never received individual queue-missile events, nothing to clear on their side
       return { ok: true, skipRelay: true };
     }
     case 'unlock-missile': {
@@ -209,7 +194,6 @@ function validateAction(ps, action) {
       if (!tmpl) return { ok: false, error: 'Invalid missile' };
       const ms = ps.missiles[tmpl.type];
       if (!ms) return { ok: false, error: 'Invalid missile' };
-      if (!ms.allowed) return { ok: false, error: 'Not allowed in this match' };
       if (ms.unlocked) return { ok: false, error: 'Already unlocked' };
       const cost = tmpl.cost * 3;
       if (ps.money < cost) return { ok: false, error: 'Not enough money' };
@@ -234,7 +218,6 @@ function validateAction(ps, action) {
       if (!tmpl) return { ok: false, error: 'Invalid defense' };
       const ds = ps.defenses[tmpl.type];
       if (!ds) return { ok: false, error: 'Invalid defense' };
-      if (!ds.allowed) return { ok: false, error: 'Not allowed in this match' };
       if (ds.unlocked) return { ok: false, error: 'Already unlocked' };
       const cost = tmpl.cost * 2;
       if (ps.money < cost) return { ok: false, error: 'Not enough money' };
@@ -343,55 +326,6 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('room-updated', room);
   });
 
-  socket.on('kick-player', ({ playerId }, cb) => {
-    const roomId = playerRooms.get(socket.id);
-    if (!roomId) return cb?.({ ok: false, error: 'Not in a room' });
-    const room = rooms.get(roomId);
-    if (!room) return cb?.({ ok: false, error: 'Room not found' });
-    if (room.host !== socket.id) return cb?.({ ok: false, error: 'Only host can kick' });
-    if (room.status !== 'waiting') return cb?.({ ok: false, error: 'Cannot kick during game' });
-    if (playerId === socket.id) return cb?.({ ok: false, error: 'Cannot kick yourself' });
-
-    const target = room.players.find(p => p.id === playerId);
-    if (!target) return cb?.({ ok: false, error: 'Player not found' });
-
-    room.players = room.players.filter(p => p.id !== playerId);
-    playerRooms.delete(playerId);
-
-    const targetSocket = io.sockets.sockets.get(playerId);
-    if (targetSocket) {
-      targetSocket.emit('kicked', 'You were kicked from the room');
-      targetSocket.leave(roomId);
-    }
-
-    cb?.({ ok: true });
-    io.to(roomId).emit('room-updated', room);
-    broadcastRoomList();
-    console.log(`[Room] ${target.nickname} was kicked from room ${roomId}`);
-  });
-
-  // ─── Chat ──────────────────────────────────────────────
-  socket.on('chat-message', ({ text, isEmote }, cb) => {
-    const roomId = playerRooms.get(socket.id);
-    if (!roomId) return cb?.({ ok: false });
-    const room = rooms.get(roomId);
-    if (!room) return cb?.({ ok: false });
-    const player = room.players.find(p => p.id === socket.id);
-    if (!player) return cb?.({ ok: false });
-
-    // Rate limit: max 60 chars, sanitize
-    const sanitized = String(text).substring(0, 60);
-    const msg = {
-      id: generateId(),
-      sender: player.nickname,
-      text: sanitized,
-      isEmote: !!isEmote,
-      timestamp: Date.now(),
-    };
-    io.to(roomId).emit('chat', msg);
-    cb?.({ ok: true });
-  });
-
   socket.on('start-game', (cb) => {
     const roomId = playerRooms.get(socket.id);
     if (!roomId) return cb({ ok: false, error: 'Not in a room' });
@@ -403,12 +337,11 @@ io.on('connection', (socket) => {
 
     room.status = 'playing';
 
+    // Initialize authoritative game state with room settings
     const gs = {
       left: createPlayerState(room.settings),
       right: createPlayerState(room.settings),
       incomeInterval: null,
-      powerUpInterval: null,
-      gameStartTime: Date.now(),
     };
 
     // Start income ticker (every second)
@@ -428,6 +361,7 @@ io.on('connection', (socket) => {
         income *= (currentRoom.settings.incomeMultiplier || 1);
         ps.money += income;
       });
+      // Send money sync to both players
       currentRoom.players.forEach(p => {
         const sock = io.sockets.sockets.get(p.id);
         const ps = gs[p.side];
@@ -436,38 +370,6 @@ io.on('connection', (socket) => {
         }
       });
     }, 1000);
-
-    // Power-up events (if enabled)
-    if (room.settings.powerUps) {
-      gs.powerUpInterval = setInterval(() => {
-        const currentRoom = rooms.get(roomId);
-        if (!currentRoom || currentRoom.status !== 'playing') {
-          clearInterval(gs.powerUpInterval);
-          return;
-        }
-        const elapsed = (Date.now() - gs.gameStartTime) / 1000;
-        if (elapsed < (currentRoom.settings.gracePeriod || 60)) return;
-
-        // Supply drop ~every 30s
-        if (Math.random() < 0.15) {
-          const event = {
-            type: 'supply-drop',
-            x: 0.1 + Math.random() * 0.8,
-            data: { amount: 50 + Math.floor(Math.random() * 100) },
-          };
-          io.to(roomId).emit('power-up', event);
-        }
-        // Meteor shower ~every 2 min
-        if (Math.random() < 0.03) {
-          const event = {
-            type: 'meteor-shower',
-            x: 0.1 + Math.random() * 0.8,
-            data: { count: 3 + Math.floor(Math.random() * 4), damage: 15 + Math.floor(Math.random() * 25) },
-          };
-          io.to(roomId).emit('power-up', event);
-        }
-      }, 5000);
-    }
 
     gameStates.set(roomId, gs);
 
@@ -497,6 +399,7 @@ io.on('connection', (socket) => {
     const result = validateAction(ps, action);
 
     if (result.ok) {
+      // skipRelay: don't forward (buffered); relayAction: send a different payload; default: relay original
       if (!result.skipRelay) {
         socket.to(roomId).emit('opponent-action', result.relayAction || action);
       }
